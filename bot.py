@@ -27,10 +27,12 @@ locks: dict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
 
 HELP = """Привет! Я записываю закупки для оприходования в ROSTA.
 
-🎙 <b>Просто надиктуй голосовым</b>, что купил, например:
+🎙 <b>Надиктуй голосовым</b>, что купил, например:
 • «Лук 35 кило по 170»
 • «Масло сливочное 2 пачки, за обе 600»
 • «Кола 12 литров на 4800, картошка 20 кг по 150»
+
+📷 <b>Или скинь фото/скрин заказа</b> (например, из приложения магазина) — разберу позиции, вес и суммы сам.
 
 Можно исправлять так же голосом или текстом: «лук не 35, а 30», «убери колу».
 Цену можно говорить за единицу или общую сумму — посчитаю сам.
@@ -168,6 +170,16 @@ async def cmd_catalog(m: Message):
         "<code>/catalog\nЛук, ( | кг\nКола, ( | л\nМасло сливочное, ( | пачка</code>")
 
 
+@router.message(F.photo | (F.document & F.document.mime_type.startswith("image/")))
+async def on_photo(m: Message, bot: Bot):
+    media = m.photo[-1] if m.photo else m.document  # самое большое разрешение
+    await bot.send_chat_action(m.chat.id, "typing")
+    buf = io.BytesIO()
+    await bot.download(media, destination=buf)
+    text = m.caption or "Фото заказа/чека из магазина — добавь все позиции."
+    await process(m, text, heard=False, image=buf.getvalue(), label="📷 Разобрал фото")
+
+
 @router.message(F.document)
 async def on_document(m: Message, bot: Bot):
     name = (m.document.file_name or "").lower()
@@ -201,12 +213,12 @@ async def on_document(m: Message, bot: Bot):
 
 # ---------------------------------------------------------------- голос и текст
 
-async def process(m: Message, text: str, heard: bool):
+async def process(m: Message, text: str, heard: bool, image: bytes | None = None, label: str = ""):
     chat_id = m.chat.id
     async with locks[chat_id]:
         draft = core.load_draft(chat_id)
         try:
-            items, comment = await core.update_items(draft["items"], text)
+            items, comment = await core.update_items(draft["items"], text, image)
         except Exception:  # noqa: BLE001
             log.exception("parse")
             await m.answer("Не получилось разобрать, попробуй ещё раз.")
@@ -214,7 +226,7 @@ async def process(m: Message, text: str, heard: bool):
         core.set_items(draft, items)
         core.save_draft(chat_id, draft)
     from html import escape
-    out = f"🎙 <i>{escape(text)}</i>\n\n" if heard else ""
+    out = f"🎙 <i>{escape(text)}</i>\n\n" if heard else (f"{label}\n\n" if label else "")
     out += core.render_list(items)
     if comment:
         out += f"\n\n💬 {escape(comment)}"

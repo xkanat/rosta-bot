@@ -137,10 +137,10 @@ def calc(item: dict) -> tuple[float | None, float | None]:
     return round(price, 2), round(price * qty, 2)
 
 
-def fmt_num(x: float | None, money: bool = False) -> str:
+def fmt_num(x: float | None, money: bool = False, digits: int = 2) -> str:
     if x is None:
         return "—"
-    s = f"{x:,.2f}".replace(",", " ").replace(".", ",")
+    s = f"{x:,.{digits}f}".replace(",", " ").replace(".", ",")
     s = s.rstrip("0").rstrip(",")
     return s + (" ₸" if money else "")
 
@@ -172,7 +172,13 @@ SYSTEM_PROMPT = """Ты ведёшь список закупки для опри
 4. unit: если у товара в справочнике указана единица — используй её и переведи количество (500 г при единице кг → 0.5). Иначе: «кг», «л», «шт», «пачка», «г», «мл» — как сказано.
 5. Цена: «по 170», «170 за кило», «по 300 за пачку» → price=170, price_type="unit". «35 кг за 5950», «на 6 тысяч», «всего 6000», «отдал 6000» → price=5950, price_type="total". Если цену не назвали — price=null, price_type="unit".
 6. Числа словами переводи в цифры: «полторы тысячи»=1500, «пять девятьсот пятьдесят»=5950, «полкило»=0.5 кг, «сто семьдесят»=170.
-7. comment: коротко по-русски, только если что-то непонятно или пришлось угадывать (например «не понял цену на хлеб»). Иначе пустая строка. Если сообщение вообще не про закупку — верни список без изменений и напиши об этом в comment."""
+7. comment: коротко по-русски, только если что-то непонятно или пришлось угадывать (например «не понял цену на хлеб»). Иначе пустая строка. Если сообщение вообще не про закупку — верни список без изменений и напиши об этом в comment.
+8. Если пришло ФОТО/скрин заказа или чека из магазина (например, приложение гипермаркета):
+   - добавь каждую строку заказа как позицию; названия магазина длинные («Огурцы Теплица», «Масло Белес подсолнечное рафинированное 5 л») — сопоставь со справочником по смыслу («огурцы», «масло подсолнечное»);
+   - бери ФАКТИЧЕСКОЕ количество/вес (например, 1,324 кг, а не «из 1,2 кг») и ИТОГОВУЮ сумму строки как price с price_type="total" (в ней уже учтены скидки);
+   - если в справочнике единица кг/л, а товар продаётся штуками с весом/объёмом в названии — пересчитай: 1 шт «5 л» → qty=5, unit="л"; 2 шт по 340 г → qty=0.68 кг. Если вес/объём не указан — оставь штуки и напиши об этом в comment;
+   - если товар не похож ни на одну позицию справочника (например, консервированный горошек — это не сухой горох) — НЕ подгоняй, напиши как в чеке коротко, in_catalog=false;
+   - если на фото не заказ/чек или ничего не разобрать — верни список без изменений и скажи об этом в comment."""
 
 SCHEMA = {
     "name": "purchase_list",
@@ -204,7 +210,7 @@ SCHEMA = {
 }
 
 
-async def update_items(items: list[dict], message: str) -> tuple[list[dict], str]:
+async def update_items(items: list[dict], message: str, image: bytes | None = None) -> tuple[list[dict], str]:
     catalog = load_catalog()
     cat_text = "\n".join(f"{c['name']}" + (f" | {c['unit']}" if c.get("unit") else "") for c in catalog) or "(пусто)"
     user = (f"Справочник сырья:\n{cat_text}\n\n"
@@ -214,7 +220,7 @@ async def update_items(items: list[dict], message: str) -> tuple[list[dict], str
         model=PARSE_MODEL,
         temperature=0,
         response_format={"type": "json_schema", "json_schema": SCHEMA},
-        messages=[{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": user}],
+        messages=[{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": _content(user, image)}],
     )
     data = json.loads(r.choices[0].message.content)
     # Модель может потерять кавычку/скобку или сменить регистр — подставляем точное название из справочника
@@ -227,6 +233,15 @@ async def update_items(items: list[dict], message: str) -> tuple[list[dict], str
                 it["unit"] = c["unit"]
         it["in_catalog"] = c is not None
     return data["items"], data["comment"].strip()
+
+
+def _content(text: str, image: bytes | None):
+    if not image:
+        return text
+    import base64
+    b64 = base64.b64encode(image).decode()
+    return [{"type": "text", "text": text},
+            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}", "detail": "high"}}]
 
 
 def _key(name: str) -> str:
@@ -257,7 +272,7 @@ def render_list(items: list[dict], date: datetime | None = None) -> str:
             price_part = "<i>цена?</i>"
         else:
             price_part = f"{fmt_num(unit_price)} ₸/{escape(it['unit'])} = <b>{fmt_num(total, True)}</b>"
-        lines.append(f"{n}. {escape(it['name'])}{mark} — {fmt_num(it['qty'])} {escape(it['unit'])} × {price_part}")
+        lines.append(f"{n}. {escape(it['name'])}{mark} — {fmt_num(it['qty'], digits=3)} {escape(it['unit'])} × {price_part}")
     lines.append(f"\n<b>Итого: {fmt_num(total_sum(items), True)}</b>")
     if no_price:
         lines.append(f"❗ Без цены: {no_price} поз.")
@@ -303,7 +318,7 @@ def build_pdf(items: list[dict], date: datetime | None = None) -> bytes:
         unit_price, total = calc(it)
         rows.append([
             Paragraph(it["name"].replace("&", "&amp;").replace("<", "&lt;"), cell),
-            f"{fmt_num(it['qty'])} {it['unit']}",
+            f"{fmt_num(it['qty'], digits=3)} {it['unit']}",
             fmt_num(unit_price),
             fmt_num(total),
         ])
