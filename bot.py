@@ -27,12 +27,10 @@ locks: dict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
 
 HELP = """Привет! Я записываю закупки для оприходования в ROSTA.
 
-🎙 <b>Надиктуй голосовым</b>, что купил, например:
+🎙 <b>Просто надиктуй голосовым</b>, что купил, например:
 • «Лук 35 кило по 170»
 • «Масло сливочное 2 пачки, за обе 600»
 • «Кола 12 литров на 4800, картошка 20 кг по 150»
-
-📷 <b>Или скинь фото/скрин заказа</b> (например, из приложения магазина) — разберу позиции, вес и суммы сам.
 
 Можно исправлять так же голосом или текстом: «лук не 35, а 30», «убери колу».
 Цену можно говорить за единицу или общую сумму — посчитаю сам.
@@ -171,13 +169,9 @@ async def cmd_catalog(m: Message):
 
 
 @router.message(F.photo | (F.document & F.document.mime_type.startswith("image/")))
-async def on_photo(m: Message, bot: Bot):
-    media = m.photo[-1] if m.photo else m.document  # самое большое разрешение
-    await bot.send_chat_action(m.chat.id, "typing")
-    buf = io.BytesIO()
-    await bot.download(media, destination=buf)
-    text = m.caption or "Фото заказа/чека из магазина — добавь все позиции."
-    await process(m, text, heard=False, image=buf.getvalue(), label="📷 Разобрал фото")
+async def on_photo(m: Message):
+    """Фото не читаем и не отвечаем — по ним пользователь сам надиктовывает голосовое."""
+    return
 
 
 @router.message(F.document)
