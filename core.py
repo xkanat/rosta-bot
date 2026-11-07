@@ -310,10 +310,11 @@ def build_pdf(items: list[dict], date: datetime | None = None) -> bytes:
     doc = SimpleDocTemplate(buf, pagesize=A4, leftMargin=15 * mm, rightMargin=15 * mm,
                             topMargin=15 * mm, bottomMargin=15 * mm,
                             title=f"Оприходование {date:%d.%m.%Y}")
-    cell = ParagraphStyle("cell", fontName="DejaVu", fontSize=10, leading=12)
-    title = ParagraphStyle("title", fontName="DejaVu-Bold", fontSize=14, leading=18)
+    cell = ParagraphStyle("cell", fontName="DejaVu", fontSize=16, leading=20)
+    head = ParagraphStyle("head", fontName="DejaVu-Bold", fontSize=13, leading=16, alignment=1)
+    title = ParagraphStyle("title", fontName="DejaVu-Bold", fontSize=24, leading=30)
 
-    rows = [["Наименование", "Кол-во", "Закупочная цена", "Сумма"]]
+    rows = [[Paragraph(h, head) for h in ("Наименование", "Кол-во", "Закупочная<br/>цена", "Сумма")]]
     for it in items:
         unit_price, total = calc(it)
         rows.append([
@@ -322,22 +323,24 @@ def build_pdf(items: list[dict], date: datetime | None = None) -> bytes:
             fmt_num(unit_price),
             fmt_num(total),
         ])
-    rows.append(["Итого", "", "", fmt_num(total_sum(items))])
+    rows.append(["ИТОГО", "", "", fmt_num(total_sum(items))])
 
-    t = Table(rows, colWidths=[80 * mm, 30 * mm, 40 * mm, 30 * mm], repeatRows=1)
+    t = Table(rows, colWidths=[68 * mm, 40 * mm, 36 * mm, 36 * mm], repeatRows=1)
     t.setStyle(TableStyle([
         ("FONTNAME", (0, 0), (-1, -1), "DejaVu"),
-        ("FONTSIZE", (0, 0), (-1, -1), 10),
-        ("FONTNAME", (0, 0), (-1, 0), "DejaVu-Bold"),
+        ("FONTSIZE", (0, 0), (-1, -1), 16),
+        ("LEADING", (0, 0), (-1, -1), 20),
         ("FONTNAME", (0, -1), (-1, -1), "DejaVu-Bold"),
-        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#E8E8E8")),
-        ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#999999")),
-        ("ALIGN", (1, 0), (-1, -1), "RIGHT"),
-        ("ALIGN", (0, 0), (-1, 0), "CENTER"),
+        ("FONTSIZE", (0, -1), (-1, -1), 18),
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#DDDDDD")),
+        ("GRID", (0, 0), (-1, -1), 1.2, colors.black),
+        ("ALIGN", (1, 1), (-1, -1), "RIGHT"),
         ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
         ("SPAN", (0, -1), (2, -1)),
-        ("TOPPADDING", (0, 0), (-1, -1), 4),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+        ("TOPPADDING", (0, 0), (-1, -1), 8),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
+        ("LEFTPADDING", (0, 0), (-1, -1), 6),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 6),
     ]))
     doc.build([Paragraph(f"Оприходование от {date:%d.%m.%Y}", title), Spacer(1, 6 * mm), t])
     return buf.getvalue()
