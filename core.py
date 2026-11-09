@@ -13,8 +13,9 @@ BASE_DIR = Path(__file__).parent
 DATA_DIR = Path(os.getenv("DATA_DIR", BASE_DIR / "data"))
 DRAFTS_DIR = DATA_DIR / "drafts"
 ARCHIVE_DIR = DATA_DIR / "archive"
+MSGS_DIR = DATA_DIR / "msgs"
 CATALOG_FILE = DATA_DIR / "catalog.json"
-for d in (DRAFTS_DIR, ARCHIVE_DIR):
+for d in (DRAFTS_DIR, ARCHIVE_DIR, MSGS_DIR):
     d.mkdir(parents=True, exist_ok=True)
 
 TZ = ZoneInfo(os.getenv("TIMEZONE", "Asia/Aqtobe"))
@@ -112,17 +113,73 @@ def set_items(draft: dict, items: list[dict]) -> None:
     draft["items"] = items
 
 
-def undo(draft: dict) -> bool:
+def mark_finished(draft: dict, info: dict) -> None:
+    """Завершение: список уходит в историю с пометкой, чтобы /undo мог убрать итоговые сообщения."""
+    draft["history"].append({"items": draft["items"], "finish": info})
+    draft["items"] = []
+
+
+def undo(draft: dict) -> tuple[bool, dict | None]:
+    """Возвращает (получилось ли, данные завершения — если отменили именно «Завершить»)."""
     if not draft["history"]:
-        return False
-    draft["items"] = draft["history"].pop()
-    return True
+        return False, None
+    entry = draft["history"].pop()
+    if isinstance(entry, dict):
+        draft["items"] = entry["items"]
+        return True, entry.get("finish")
+    draft["items"] = entry
+    return True, None
 
 
-def archive(chat_id: int, items: list[dict]) -> None:
-    stamp = now().strftime("%Y-%m-%d_%H-%M-%S")
-    (ARCHIVE_DIR / f"{chat_id}_{stamp}.json").write_text(
-        json.dumps(items, ensure_ascii=False, indent=1), "utf-8")
+def archive(chat_id: int, items: list[dict]) -> str:
+    stamp = now().strftime("%Y-%m-%d_%H-%M-%S-%f")
+    name = f"{chat_id}_{stamp}.json"
+    (ARCHIVE_DIR / name).write_text(json.dumps(items, ensure_ascii=False, indent=1), "utf-8")
+    return name
+
+
+def unarchive(name: str | None) -> None:
+    if name:
+        (ARCHIVE_DIR / Path(name).name).unlink(missing_ok=True)
+
+
+# ---------------------------------------------------------------- сообщения для очистки чата
+# Все сообщения после прошлого «Завершить» (голосовые, скрины, ответы бота) записываются сюда,
+# чтобы при следующем «Завершить» удалить их и оставить в чате только итоговый список и PDF.
+# Функции синхронные, без await внутри — в asyncio чтение+запись файла не пересекаются.
+
+def _msgs_path(chat_id: int) -> Path:
+    return MSGS_DIR / f"{chat_id}.json"
+
+
+def _load_msgs(chat_id: int) -> list[int]:
+    p = _msgs_path(chat_id)
+    if p.exists():
+        try:
+            return json.loads(p.read_text("utf-8"))
+        except ValueError:
+            return []
+    return []
+
+
+def track_msgs(chat_id: int, ids: list[int]) -> None:
+    cur = _load_msgs(chat_id)
+    seen = set(cur)
+    cur += [i for i in ids if i not in seen]
+    _msgs_path(chat_id).write_text(json.dumps(cur[-3000:]), "utf-8")
+
+
+def untrack_msgs(chat_id: int, ids: list[int]) -> None:
+    drop = set(ids)
+    _msgs_path(chat_id).write_text(json.dumps([i for i in _load_msgs(chat_id) if i not in drop]), "utf-8")
+
+
+def take_msgs(chat_id: int, keep: list[int] = ()) -> list[int]:
+    """Забирает накопленные id на удаление (кроме keep) и очищает список."""
+    keep = set(keep)
+    ids = [i for i in _load_msgs(chat_id) if i not in keep]
+    _msgs_path(chat_id).write_text("[]", "utf-8")
+    return ids
 
 
 # ---------------------------------------------------------------- расчёты
@@ -253,14 +310,19 @@ def _key(name: str) -> str:
 
 # ---------------------------------------------------------------- вывод
 
-def render_list(items: list[dict], date: datetime | None = None) -> str:
-    """HTML для Telegram."""
+FINAL_TAG = "#оприходование"
+
+
+def render_list(items: list[dict], date: datetime | None = None, final: bool = False) -> str:
+    """HTML для Telegram. final=True — итоговый список, который остаётся в чате после «Завершить»."""
     from html import escape
     date = date or now()
     if not items:
         return f"🧾 <b>Закупка {date:%d.%m.%Y}</b>\n\nСписок пуст. Надиктуй, что купил."
     has_catalog = bool(load_catalog())
-    lines = [f"🧾 <b>Закупка {date:%d.%m.%Y}</b>\n"]
+    header = (f"📋 <b>Оприходование {date:%d.%m.%Y}</b> · {date:%H:%M}" if final
+              else f"🧾 <b>Закупка {date:%d.%m.%Y}</b>")
+    lines = [header + "\n"]
     no_price = not_found = 0
     for n, it in enumerate(items, 1):
         unit_price, total = calc(it)
@@ -278,6 +340,8 @@ def render_list(items: list[dict], date: datetime | None = None) -> str:
         lines.append(f"❗ Без цены: {no_price} поз.")
     if not_found:
         lines.append(f"⚠️ Нет в справочнике: {not_found} поз. — проверь название")
+    if final:
+        lines.append(f"\n{FINAL_TAG}")
     return "\n".join(lines)
 
 
