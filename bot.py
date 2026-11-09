@@ -9,10 +9,13 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from aiogram import Bot, Dispatcher, F, Router  # noqa: E402
+from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router  # noqa: E402
 from aiogram.client.default import DefaultBotProperties  # noqa: E402
+from aiogram.client.session.middlewares.base import BaseRequestMiddleware  # noqa: E402
 from aiogram.enums import ParseMode  # noqa: E402
+from aiogram.exceptions import TelegramAPIError  # noqa: E402
 from aiogram.filters import Command, CommandStart  # noqa: E402
+from aiogram.methods import Response  # noqa: E402
 from aiogram.types import (BufferedInputFile, CallbackQuery, InlineKeyboardButton,  # noqa: E402
                            InlineKeyboardMarkup, Message)
 
@@ -36,9 +39,11 @@ HELP = """Привет! Я записываю закупки для оприхо
 Цену можно говорить за единицу или общую сумму — посчитаю сам.
 
 <b>Кнопки под списком:</b>
-✅ Завершить — пришлю PDF и очищу список
+✅ Завершить — пришлю итоговый список и PDF, а всю переписку по этой закупке удалю
 ↩️ Отменить — вернуть как было до последнего сообщения
 🗑 Очистить — начать заново
+
+В чате остаются только итоговые списки и PDF. Найти закупку за день — поиск по чату (например «07.11») или нажми на #оприходование.
 
 <b>Команды:</b> /list — текущий список, /done — завершить, /undo, /clear
 /catalog — справочник сырья (точные названия как в ROSTA)
@@ -53,6 +58,57 @@ KB = InlineKeyboardMarkup(inline_keyboard=[[
 
 def allowed(user_id: int) -> bool:
     return not ALLOWED or user_id in ALLOWED
+
+
+# ---------------------------------------------------------------- учёт сообщений для очистки чата
+
+class TrackIncoming(BaseMiddleware):
+    """Запоминает каждое входящее сообщение (голосовые, скрины, текст, команды)."""
+
+    async def __call__(self, handler, event: Message, data):
+        if event.from_user and allowed(event.from_user.id):
+            core.track_msgs(event.chat.id, [event.message_id])
+        return await handler(event, data)
+
+
+class TrackOutgoing(BaseRequestMiddleware):
+    """Запоминает каждое сообщение, которое отправил бот."""
+
+    async def __call__(self, make_request, bot, method):
+        response = await make_request(bot, method)
+        # aiogram отдаёт здесь сам результат (Message), но на всякий случай понимаем и обёртку Response
+        res = response.result if isinstance(response, Response) else response
+        for r in (res if isinstance(res, list) else [res]):
+            if isinstance(r, Message):
+                core.track_msgs(r.chat.id, [r.message_id])
+        return response
+
+
+async def wipe(bot: Bot, chat_id: int, ids: list[int]) -> None:
+    """Удаляет сообщения пачками по 100. Telegram не даёт удалять сообщения старше 48 часов — их пропускаем."""
+    for i in range(0, len(ids), 100):
+        chunk = ids[i:i + 100]
+        try:
+            await bot.delete_messages(chat_id, chunk)
+        except TelegramAPIError:
+            for mid in chunk:
+                try:
+                    await bot.delete_message(chat_id, mid)
+                except TelegramAPIError:
+                    pass
+
+
+_bg: set[asyncio.Task] = set()
+
+
+def delete_later(bot: Bot, chat_id: int, msg_id: int, delay: int = 120) -> None:
+    async def _run():
+        await asyncio.sleep(delay)
+        await wipe(bot, chat_id, [msg_id])
+        core.untrack_msgs(chat_id, [msg_id])
+    t = asyncio.create_task(_run())
+    _bg.add(t)
+    t.add_done_callback(_bg.discard)
 
 
 @router.message(Command("id"))
@@ -94,15 +150,21 @@ async def do_finish(chat_id: int, bot: Bot, reply_to: Message):
         no_price = [i["name"] for i in items if i.get("price") is None]
         date = core.now()
         pdf = core.build_pdf(items, date)
-        core.archive(chat_id, items)
-        core.set_items(draft, [])
+        caption = (f"Оприходование {date:%d.%m.%Y} — {len(items)} поз., "
+                   f"итого {core.fmt_num(core.total_sum(items), True)}")
+        if no_price:
+            caption += "\n❗ Без цены: " + ", ".join(no_price)
+        # Сначала итог: если отправка сорвётся, ничего не удалим и список останется как был
+        list_msg = await bot.send_message(chat_id, core.render_list(items, date, final=True))
+        doc_msg = await bot.send_document(
+            chat_id, BufferedInputFile(pdf, f"oprihodovanie_{date:%Y-%m-%d_%H-%M}.pdf"), caption=caption)
+        final_ids = [list_msg.message_id, doc_msg.message_id]
+        core.mark_finished(draft, {"msg_ids": final_ids, "archive": core.archive(chat_id, items)})
         core.save_draft(chat_id, draft)
-    caption = f"Оприходование {date:%d.%m.%Y} — {len(items)} поз., итого {core.fmt_num(core.total_sum(items), True)}"
-    if no_price:
-        caption += "\n❗ Без цены: " + ", ".join(no_price)
-    await bot.send_document(chat_id, BufferedInputFile(pdf, f"oprihodovanie_{date:%Y-%m-%d_%H-%M}.pdf"),
-                            caption=caption)
-    await reply_to.answer("Список очищен. Если завершил случайно — /undo вернёт его.")
+        old_ids = core.take_msgs(chat_id, keep=final_ids)
+    await wipe(bot, chat_id, old_ids)
+    hint = await bot.send_message(chat_id, "✅ Готово, переписку почистил. Завершил случайно — /undo")
+    delete_later(bot, chat_id, hint.message_id)
 
 
 @router.message(Command("done"))
@@ -110,13 +172,20 @@ async def cmd_done(m: Message, bot: Bot):
     await do_finish(m.chat.id, bot, m)
 
 
-async def do_undo(chat_id: int) -> str:
+async def do_undo(chat_id: int, bot: Bot) -> str:
     async with locks[chat_id]:
         draft = core.load_draft(chat_id)
-        if not core.undo(draft):
+        ok, finished = core.undo(draft)
+        if not ok:
             return "Отменять нечего."
         core.save_draft(chat_id, draft)
-        return "↩️ Вернул как было.\n\n" + core.render_list(draft["items"])
+        if finished:
+            core.unarchive(finished.get("archive"))
+    if finished:
+        # Отменили «Завершить» — убираем итоговый список и PDF, чтобы за день не было дублей
+        await wipe(bot, chat_id, finished.get("msg_ids", []))
+        return "↩️ Отменил завершение, итоговый список и PDF убрал. Продолжаем:\n\n" + core.render_list(draft["items"])
+    return "↩️ Вернул как было.\n\n" + core.render_list(draft["items"])
 
 
 async def do_clear(chat_id: int) -> str:
@@ -128,8 +197,8 @@ async def do_clear(chat_id: int) -> str:
 
 
 @router.message(Command("undo"))
-async def cmd_undo(m: Message):
-    await m.answer(await do_undo(m.chat.id), reply_markup=KB)
+async def cmd_undo(m: Message, bot: Bot):
+    await m.answer(await do_undo(m.chat.id, bot), reply_markup=KB)
 
 
 @router.message(Command("clear"))
@@ -144,7 +213,7 @@ async def on_button(c: CallbackQuery, bot: Bot):
     if c.data == "done":
         await do_finish(chat_id, bot, c.message)
     elif c.data == "undo":
-        await c.message.answer(await do_undo(chat_id), reply_markup=KB)
+        await c.message.answer(await do_undo(chat_id, bot), reply_markup=KB)
     else:
         await c.message.answer(await do_clear(chat_id))
 
@@ -255,7 +324,9 @@ async def main():
     if not ALLOWED:
         log.warning("ALLOWED_USER_IDS не задан — ботом может пользоваться кто угодно!")
     bot = Bot(os.environ["BOT_TOKEN"], default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+    bot.session.middleware(TrackOutgoing())
     dp = Dispatcher()
+    dp.message.outer_middleware(TrackIncoming())
     dp.include_router(router)
     await dp.start_polling(bot)
 
