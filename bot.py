@@ -4,6 +4,7 @@ import io
 import logging
 import os
 from collections import defaultdict
+from html import escape
 
 from dotenv import load_dotenv
 
@@ -39,11 +40,11 @@ HELP = """Привет! Я записываю закупки для оприхо
 Цену можно говорить за единицу или общую сумму — посчитаю сам.
 
 <b>Кнопки под списком:</b>
-✅ Завершить — пришлю итоговый список и PDF, а всю переписку по этой закупке удалю
+✅ Завершить — пришлю PDF, а всю переписку по этой закупке удалю
 ↩️ Отменить — вернуть как было до последнего сообщения
 🗑 Очистить — начать заново
 
-В чате остаются только итоговые списки и PDF. Найти закупку за день — поиск по чату (например «07.11») или нажми на #оприходование.
+В чате остаются только PDF. Найти закупку за день — поиск по чату (например «07.11») или нажми на #оприходование.
 
 <b>Команды:</b> /list — текущий список, /done — завершить, /undo, /clear
 /catalog — справочник сырья (точные названия как в ROSTA)
@@ -150,15 +151,18 @@ async def do_finish(chat_id: int, bot: Bot, reply_to: Message):
         no_price = [i["name"] for i in items if i.get("price") is None]
         date = core.now()
         pdf = core.build_pdf(items, date)
-        caption = (f"Оприходование {date:%d.%m.%Y} — {len(items)} поз., "
-                   f"итого {core.fmt_num(core.total_sum(items), True)}")
+        caption = (f"📋 <b>Оприходование {date:%d.%m.%Y}</b> · {date:%H:%M}\n"
+                   f"{len(items)} поз., итого <b>{core.fmt_num(core.total_sum(items), True)}</b>")
         if no_price:
-            caption += "\n❗ Без цены: " + ", ".join(no_price)
-        # Сначала итог: если отправка сорвётся, ничего не удалим и список останется как был
-        list_msg = await bot.send_message(chat_id, core.render_list(items, date, final=True))
+            names = ", ".join(no_price)
+            if len(names) > 700:  # лимит подписи в Telegram — 1024 символа
+                names = names[:700].rsplit(",", 1)[0] + "…"
+            caption += "\n❗ Без цены: " + escape(names)
+        caption += f"\n\n{core.FINAL_TAG}"
+        # В чате остаётся только PDF. Сначала отправляем его: если отправка сорвётся, ничего не удалим
         doc_msg = await bot.send_document(
             chat_id, BufferedInputFile(pdf, f"oprihodovanie_{date:%Y-%m-%d_%H-%M}.pdf"), caption=caption)
-        final_ids = [list_msg.message_id, doc_msg.message_id]
+        final_ids = [doc_msg.message_id]
         core.mark_finished(draft, {"msg_ids": final_ids, "archive": core.archive(chat_id, items)})
         core.save_draft(chat_id, draft)
         old_ids = core.take_msgs(chat_id, keep=final_ids)
@@ -182,9 +186,9 @@ async def do_undo(chat_id: int, bot: Bot) -> str:
         if finished:
             core.unarchive(finished.get("archive"))
     if finished:
-        # Отменили «Завершить» — убираем итоговый список и PDF, чтобы за день не было дублей
+        # Отменили «Завершить» — убираем PDF, чтобы за день не было дублей
         await wipe(bot, chat_id, finished.get("msg_ids", []))
-        return "↩️ Отменил завершение, итоговый список и PDF убрал. Продолжаем:\n\n" + core.render_list(draft["items"])
+        return "↩️ Отменил завершение, PDF убрал. Продолжаем:\n\n" + core.render_list(draft["items"])
     return "↩️ Вернул как было.\n\n" + core.render_list(draft["items"])
 
 
@@ -288,7 +292,6 @@ async def process(m: Message, text: str, heard: bool, image: bytes | None = None
             return
         core.set_items(draft, items)
         core.save_draft(chat_id, draft)
-    from html import escape
     out = f"🎙 <i>{escape(text)}</i>\n\n" if heard else (f"{label}\n\n" if label else "")
     out += core.render_list(items)
     if comment:
